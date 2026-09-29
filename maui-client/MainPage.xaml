@@ -49,6 +49,16 @@
                            IsEnabled="{Binding IsNotRunning}" />
                 </VerticalStackLayout>
 
+                <!-- E2E Key -->
+                <VerticalStackLayout Spacing="4">
+                    <Label Text="E2E Key (recommended)" FontSize="12"
+                           TextColor="{AppThemeBinding Light=Gray, Dark=LightGray}" />
+                    <Entry x:Name="E2EKeyEntry"
+                           Placeholder="same as e2eKey on the adapter"
+                           IsPassword="True"
+                           IsEnabled="{Binding IsNotRunning}" />
+                </VerticalStackLayout>
+
                 <!-- Listen Address + Port -->
                 <Grid ColumnDefinitions="2*,*" ColumnSpacing="8">
                     <VerticalStackLayout Spacing="4">

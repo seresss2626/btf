@@ -1,0 +1,6 @@
+{
+  "name": "btf-e2e-tests",
+  "private": true,
+  "description": "Local end-to-end test harness (gateway simulator). Not deployed.",
+  "devDependencies": { "ws": "^8.18.0" }
+}

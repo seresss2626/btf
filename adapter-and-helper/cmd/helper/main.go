@@ -13,6 +13,7 @@ import (
 
 	"github.com/bridge-to-freedom/adapter/internal/config"
 	"github.com/bridge-to-freedom/adapter/internal/protocol"
+	"github.com/bridge-to-freedom/adapter/internal/secure"
 	"github.com/bridge-to-freedom/adapter/internal/streams"
 	"github.com/bridge-to-freedom/adapter/internal/upstream"
 	"github.com/bridge-to-freedom/adapter/internal/wsapi"
@@ -31,6 +32,15 @@ func main() {
 
 	log.SetOutput(os.Stderr)
 	log.SetFlags(log.LstdFlags)
+
+	warnings, err := cfg.Validate(secure.RoleHelper)
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	for _, w := range warnings {
+		log.Printf("[WARN] %s", w)
+	}
+	keys := secure.Derive(cfg.Bridge.AuthToken, cfg.Bridge.E2EKey)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -68,9 +78,14 @@ func main() {
 	}
 
 	sm := streams.NewManager(func(data []byte) error {
+		// Every stream frame is sealed for the adapter (encrypted + MAC'd).
+		sealed, err := keys.Seal(secure.DirHelperToAdapter, data)
+		if err != nil {
+			return err
+		}
 		if relay {
-			// Relay mode: send through upstream WS
-			return ups.Send(data)
+			// Relay mode: send through upstream WS (ticket appended by Send).
+			return ups.Send(sealed)
 		}
 		// Direct mode: wsSend to adapter
 		peerID := ups.PeerConnID()
@@ -78,7 +93,7 @@ func main() {
 		if peerID == "" || token == "" {
 			return fmt.Errorf("no peer connected")
 		}
-		err := wsClient.Send(peerID, data, "BINARY", token)
+		err = wsClient.Send(peerID, sealed, "BINARY", token)
 		if err != nil {
 			if wsapi.IsConnectionNotFound(err) {
 				// Definitive: the adapter's connection is gone. Compare-and-clear
@@ -100,11 +115,11 @@ func main() {
 	// client (both of which already reorder on receive).
 	sm.Reorder = true
 
-	ups = upstream.New(cfg, func(f protocol.Frame) {
+	ups = upstream.New(cfg, secure.RoleHelper, keys, func(f protocol.Frame) {
 		switch f.Type {
 		// --- Control ---
 		case protocol.MsgPeerConn:
-			peerID, iamToken, _, err := protocol.DecodePeerConn(f.Payload)
+			peerID, iamToken, confirmedShortID, err := protocol.DecodePeerConn(f.Payload)
 			if err != nil {
 				log.Printf("[WARN] bad PEER_CONN: %v", err)
 				return
@@ -114,12 +129,18 @@ func main() {
 				return
 			}
 			ups.ClearStaleConnID()
-			cancelPendingOpens("new peer connected")
-			log.Printf("[INFO] PEER_CONN received: peerID=%s tokenLen=%d", peerID, len(iamToken))
+			// The cloud function re-announces the SAME adapter on every adapter
+			// PING (~30s). Only a genuinely new adapter connection invalidates
+			// in-flight OPENs; otherwise we'd randomly kill connections.
+			if cur := ups.PeerConnID(); cur != "" && cur != peerID {
+				cancelPendingOpens("adapter reconnected")
+			}
+			log.Printf("[DEBUG] PEER_CONN received: peerID=%s tokenLen=%d", peerID, len(iamToken))
 			ups.SetPeerConnID(peerID)
 			if iamToken != "" {
 				ups.SetIAMToken(iamToken)
 			}
+			adoptShortID(ups, confirmedShortID)
 		case protocol.MsgPeerGone:
 			if relay {
 				// In relay mode the data path runs through the cloud (our upstream
@@ -138,13 +159,14 @@ func main() {
 			cancelPendingOpens("peer gone")
 			sm.CloseAll()
 		case protocol.MsgPong:
-			iamToken, err := protocol.DecodePong(f.Payload)
+			iamToken, confirmedShortID, err := protocol.DecodePong(f.Payload)
 			if err != nil {
 				log.Printf("[WARN] bad PONG: %v", err)
 				return
 			}
 			log.Printf("[DEBUG] PONG received, tokenLen=%d", len(iamToken))
 			ups.SetIAMToken(iamToken)
+			adoptShortID(ups, confirmedShortID)
 		case protocol.MsgPing:
 			// We never answer PINGs (only the cloud function does). A stray PING
 			// can still reach us if an older cloud function relays a peer's
@@ -213,7 +235,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
-	log.Printf("[INFO] helper starting bridge=%s listen=%s relay=%v coalesce=%v", cfg.Bridge.URL, cfg.Listen.Address, relay, cfg.CoalesceDelay())
+	log.Printf("[INFO] helper starting listen=%s relay=%v coalesce=%v e2e=%v", cfg.Listen.Address, relay, cfg.CoalesceDelay(), keys.E2E)
 
 	// Accept loop in background
 	go func() {
@@ -241,6 +263,18 @@ func main() {
 
 	// Run upstream (blocks until ctx cancelled)
 	ups.Run(ctx)
+}
+
+// adoptShortID switches to the adapter-confirmed short ID (sent by the cloud
+// function in PONG / PEER_CONN). Only new streams use the new ID.
+func adoptShortID(ups *upstream.Upstream, id byte) {
+	if id == 0 {
+		return
+	}
+	if cur := ups.HelperShortID(); cur != id {
+		log.Printf("[INFO] helper shortID changed %d -> %d (confirmed by adapter)", cur, id)
+		ups.SetHelperShortID(id)
+	}
 }
 
 func handleConn(ctx context.Context, conn net.Conn, ups *upstream.Upstream, sm *streams.Manager, pendingMu *sync.Mutex, pendingOpens map[uint32]chan protocol.Frame, relay bool) {

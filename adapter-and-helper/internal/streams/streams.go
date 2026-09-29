@@ -396,7 +396,7 @@ func (m *Manager) resetStream(streamID uint32) {
 		if s := m.Get(streamID); s != nil {
 			m.CloseStream(s) // Remove() clears the reorder buffer + seq counter.
 		} else {
-			m.dropReorderBuf(streamID)
+			m.Remove(streamID) // SendFrame above created a seq counter; drop it too.
 		}
 	}()
 }

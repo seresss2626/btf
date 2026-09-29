@@ -83,15 +83,6 @@ public static class Protocol
         return (type, streamId, seqId, payload);
     }
 
-    public static byte[] EncodeHello(byte version, string token)
-    {
-        var t = Encoding.UTF8.GetBytes(token);
-        var buf = new byte[1 + t.Length];
-        buf[0] = version;
-        t.CopyTo(buf, 1);
-        return buf;
-    }
-
     public static (string OwnId, string PeerId, string IamToken, byte HelperShortId) DecodeHelloOK(byte[] payload)
     {
         int off = 0;
@@ -106,21 +97,35 @@ public static class Protocol
         return (ownId, peerId, iamToken, helperShortId);
     }
 
-    public static (string PeerId, string IamToken) DecodePeerConn(byte[] payload)
+    /// <summary>
+    /// PEER_CONN: [2B len][peerId][2B len][iamToken][1B helperShortId?]. In the
+    /// helper-bound direction (v5) the optional trailing byte is this helper's
+    /// adapter-confirmed shortId (0 = none).
+    /// </summary>
+    public static (string PeerId, string IamToken, byte HelperShortId) DecodePeerConn(byte[] payload)
     {
         int off = 0;
         var peerId = ReadLenPrefixed(payload, ref off);
         var iamToken = ReadLenPrefixed(payload, ref off);
-        // Optional trailing helperShortId byte in this payload is only used in
-        // the cloud-function -> adapter direction; helpers can safely ignore.
-        return (peerId, iamToken);
+        byte sid = (byte)(off < payload.Length ? payload[off] : 0);
+        return (peerId, iamToken, sid);
     }
 
-    public static string DecodePong(byte[] payload)
+    /// <summary>PONG: [2B len][iamToken][1B helperShortId?] (trailing byte v5, helper-bound).</summary>
+    public static (string IamToken, byte HelperShortId) DecodePong(byte[] payload)
     {
         int off = 0;
-        return ReadLenPrefixed(payload, ref off);
+        var token = ReadLenPrefixed(payload, ref off);
+        byte sid = (byte)(off < payload.Length ? payload[off] : 0);
+        return (token, sid);
     }
+
+    /// <summary>
+    /// v5 PING/SYNC payload: the helper's current shortId claim (empty if 0), so
+    /// cloud-function instances that don't know us re-register the same ID.
+    /// </summary>
+    public static byte[] EncodeClaim(byte helperShortId) =>
+        helperShortId == 0 ? [] : [helperShortId];
 
     private static string ReadLenPrefixed(byte[] data, ref int off)
     {

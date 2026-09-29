@@ -5,11 +5,14 @@ import (
 	"crypto/tls"
 	"fmt"
 	"log"
+	"net"
+	"os"
 	"sync"
 	"time"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/metadata"
 
 	ws "github.com/yandex-cloud/go-genproto/yandex/cloud/serverless/apigateway/websocket/v1"
@@ -38,14 +41,27 @@ func (g *grpcClient) ensure() (ws.ConnectionServiceClient, error) {
 	if g.client != nil {
 		return g.client, nil
 	}
-	creds := credentials.NewTLS(&tls.Config{})
-	conn, err := grpc.NewClient(grpcEndpoint, grpc.WithTransportCredentials(creds))
+	endpoint := grpcEndpoint
+	creds := credentials.NewTLS(&tls.Config{MinVersion: tls.VersionTLS12})
+	// Test hook: BTF_TEST_WSAPI_ENDPOINT points the client at a local fake
+	// API. It is only honoured for loopback addresses, so it can never be
+	// used to send IAM tokens to a remote host in clear text.
+	if ep := os.Getenv("BTF_TEST_WSAPI_ENDPOINT"); ep != "" {
+		host, _, err := net.SplitHostPort(ep)
+		if ip := net.ParseIP(host); err != nil || ip == nil || !ip.IsLoopback() {
+			return nil, fmt.Errorf("BTF_TEST_WSAPI_ENDPOINT must be a loopback host:port")
+		}
+		endpoint = ep
+		creds = insecure.NewCredentials()
+		log.Println("[WARN] using TEST wsApi endpoint", ep)
+	}
+	conn, err := grpc.NewClient(endpoint, grpc.WithTransportCredentials(creds))
 	if err != nil {
 		return nil, fmt.Errorf("grpc dial: %w", err)
 	}
 	g.conn = conn
 	g.client = ws.NewConnectionServiceClient(conn)
-	log.Println("[INFO] gRPC WS API client initialized:", grpcEndpoint)
+	log.Println("[INFO] gRPC WS API client initialized:", endpoint)
 	return g.client, nil
 }
 

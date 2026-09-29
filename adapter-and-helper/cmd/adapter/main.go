@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -10,12 +9,14 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/bridge-to-freedom/adapter/internal/config"
 	"github.com/bridge-to-freedom/adapter/internal/protocol"
+	"github.com/bridge-to-freedom/adapter/internal/secure"
 	"github.com/bridge-to-freedom/adapter/internal/streams"
 	"github.com/bridge-to-freedom/adapter/internal/upstream"
 	"github.com/bridge-to-freedom/adapter/internal/wsapi"
@@ -32,16 +33,19 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	// The HTTP recovery endpoint is required: the cloud function polls it on
-	// cold start to recover adapter/helper connection IDs. Without it the
-	// tunnel will appear to work briefly, but break as soon as the function
-	// instance recycles.
-	if cfg.HTTP.ListenPort <= 0 {
-		log.Fatalf("http.listenPort must be > 0 (the cloud function needs the recovery endpoint to be reachable; set e.g. 8080 in adapter.config.yaml)")
-	}
-
 	log.SetOutput(os.Stderr)
 	log.SetFlags(log.LstdFlags)
+
+	// Validate secrets and required settings (the HTTP recovery endpoint is
+	// required: the cloud function polls it on cold start).
+	warnings, err := cfg.Validate(secure.RoleAdapter)
+	if err != nil {
+		log.Fatalf("config: %v", err)
+	}
+	for _, w := range warnings {
+		log.Printf("[WARN] %s", w)
+	}
+	keys := secure.Derive(cfg.Bridge.AuthToken, cfg.Bridge.E2EKey)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -65,7 +69,11 @@ func main() {
 		if peerID == "" || token == "" {
 			return fmt.Errorf("no helper for shortID=%d", shortID)
 		}
-		err := wsClient.Send(peerID, data, "BINARY", token)
+		sealed, err := keys.Seal(secure.DirAdapterToHelper, data)
+		if err != nil {
+			return err
+		}
+		err = wsClient.Send(peerID, sealed, "BINARY", token)
 		if err != nil {
 			if wsapi.IsConnectionNotFound(err) {
 				// Definitive: this helper's connection is gone. Drop just this
@@ -88,7 +96,7 @@ func main() {
 	sm.CoalesceDelay = cfg.CoalesceDelay()
 	sm.Reorder = true
 
-	ups = upstream.New(cfg, func(f protocol.Frame) {
+	ups = upstream.New(cfg, secure.RoleAdapter, keys, func(f protocol.Frame) {
 		switch f.Type {
 		// --- Control ---
 		case protocol.MsgPeerConn:
@@ -128,7 +136,7 @@ func main() {
 				log.Printf("[INFO] PEER_GONE received: shortID=%d peerID=%s closed=%d streams", shortID, old, n)
 			}
 		case protocol.MsgPong:
-			iamToken, err := protocol.DecodePong(f.Payload)
+			iamToken, _, err := protocol.DecodePong(f.Payload)
 			if err != nil {
 				log.Printf("[WARN] bad PONG: %v", err)
 				return
@@ -209,20 +217,32 @@ func main() {
 				w.WriteHeader(http.StatusMethodNotAllowed)
 				return
 			}
-			token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-			if subtle.ConstantTimeCompare([]byte(token), []byte(cfg.Bridge.AuthToken)) != 1 {
+			// v5: time-limited HMAC instead of the raw shared secret, so the
+			// secret never crosses the (possibly plain-HTTP) link. The response
+			// is signed too, so a man-in-the-middle can't feed the cloud
+			// function a fake adapter connection ID. The IAM token is no
+			// longer accepted here (it used to arrive in clear text).
+			assign := r.URL.Query().Get("assign")
+			want := r.URL.Query().Get("want")
+			ts, ok := keys.VerifyConnIDsAuth(r.Header.Get("Authorization"), assign, want, time.Now())
+			if !ok {
 				log.Printf("[WARN] %s unauthorized request from %s", httpPath, r.RemoteAddr)
-				w.WriteHeader(http.StatusUnauthorized)
+				// Plain 404: don't advertise that something lives here.
+				http.NotFound(w, r)
 				return
 			}
-			// Cloud function may piggyback its current YC IAM token here so we
-			// can refresh ours without a PING/PONG round trip. Allows us to keep
-			// the periodic PING loop low-frequency / peer-gated.
-			if iamToken := r.Header.Get("X-IAM-Token"); iamToken != "" {
-				ups.SetIAMToken(iamToken)
-				log.Printf("[INFO] %s refreshed IAM token from %s tokenLen=%d", httpPath, r.RemoteAddr, len(iamToken))
-			}
 			own := ups.OwnConnID()
+			if own != "" && assign != "" && len(assign) <= 128 {
+				// The function asks us to allocate (or look up) the shortId
+				// for a newly authenticated helper connection.
+				w8, _ := strconv.Atoi(want)
+				if w8 < 0 || w8 > 255 {
+					w8 = 0
+				}
+				if sid := ups.AssignHelper(assign, byte(w8)); sid != 0 {
+					log.Printf("[INFO] assigned helper shortID=%d connId=%s", sid, assign)
+				}
+			}
 			peer := ups.PeerConnID()
 			helpers := ups.Helpers()
 			if own == "" {
@@ -247,8 +267,15 @@ func main() {
 				"helperConnId":  peer, // legacy single-helper compat
 				"helpers":       helperList,
 			}
+			body, err := json.Marshal(resp)
+			if err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
 			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(resp)
+			w.Header().Set("Cache-Control", "no-store")
+			w.Header().Set("X-BTF-Sig", keys.ConnIDsRespSig(ts, body))
+			w.Write(body)
 		})
 		addr := fmt.Sprintf(":%d", cfg.HTTP.ListenPort)
 		// This endpoint is exposed to the public internet (the cloud function
@@ -271,7 +298,7 @@ func main() {
 		go func() { <-ctx.Done(); srv.Close() }()
 	}
 
-	log.Printf("[INFO] adapter starting bridge=%s target=%s coalesce=%v", cfg.Bridge.URL, cfg.Target.Address, cfg.CoalesceDelay())
+	log.Printf("[INFO] adapter starting target=%s coalesce=%v e2e=%v", cfg.Target.Address, cfg.CoalesceDelay(), keys.E2E)
 	ups.Run(ctx)
 }
 
@@ -280,6 +307,7 @@ func handleOpen(cfg *config.Config, sm *streams.Manager, streamID uint32) {
 	if err != nil {
 		log.Printf("[WARN] target connect failed stream=%d err=%v", streamID, err)
 		sm.SendFrame(protocol.Frame{Type: protocol.MsgOpenFail, StreamID: streamID, Payload: []byte(err.Error())})
+		sm.Remove(streamID) // drop the seq counter / reorder buffer for this stream
 		return
 	}
 

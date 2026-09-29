@@ -2,7 +2,15 @@
 
 bridge:
   url: "wss://YOUR_APIGW_ID.apigw.yandexcloud.net/_adapter"
+  # Shared secret, identical in the adapter, every helper and the cloud
+  # function (AUTH_TOKEN env var). At least 16 characters — generate with:
+  #   openssl rand -hex 32
   authToken: "YOUR_AUTH_TOKEN"
+  # End-to-end key, identical in the adapter and every helper, and NEVER given
+  # to the cloud function. With it, neither the function nor the cloud provider
+  # can read or forge your tunnel traffic. Strongly recommended; must differ
+  # from authToken. Generate with: openssl rand -hex 32
+  e2eKey: "YOUR_E2E_KEY"
   reconnect:
     initialDelayMs: 1000
     maxDelayMs: 30000
@@ -26,6 +34,7 @@ target:
 # (full URL: scheme://host:port + path).
 http:
   listenPort: 8080
+  # Use a random path of your own, e.g. "/p4f9z2k8".
   path: "/conn-ids"
 
 

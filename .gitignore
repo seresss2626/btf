@@ -30,3 +30,6 @@ maui-client/publish
 maui-client-linux/bin
 maui-client-linux/obj
 maui-client-linux/publish
+tests/e2e/node_modules/
+tests/maui-services/bin/
+tests/maui-services/obj/

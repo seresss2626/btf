@@ -263,14 +263,29 @@ func EncodePong(iamToken string) []byte {
 	return buf
 }
 
-// DecodePong parses a PONG payload.
-func DecodePong(payload []byte) (iamToken string, err error) {
+// DecodePong parses a PONG payload: [2B tokenLen][iamToken][1B helperShortID?].
+// The optional trailing byte (v5, helper-bound only) is the helper's
+// adapter-confirmed short ID; 0 if absent.
+func DecodePong(payload []byte) (iamToken string, helperShortID byte, err error) {
 	if len(payload) < 2 {
-		return "", errors.New("PONG payload too short")
+		return "", 0, errors.New("PONG payload too short")
 	}
 	tLen := int(binary.BigEndian.Uint16(payload[0:]))
 	if 2+tLen > len(payload) {
-		return "", errors.New("PONG: bad token length")
+		return "", 0, errors.New("PONG: bad token length")
 	}
-	return string(payload[2 : 2+tLen]), nil
+	if len(payload) > 2+tLen {
+		helperShortID = payload[2+tLen]
+	}
+	return string(payload[2 : 2+tLen]), helperShortID, nil
+}
+
+// EncodeClaim builds the v5 PING/SYNC payload a helper sends: its current
+// short ID (0 if none), so function instances that don't know the helper yet
+// can re-register it under the same ID instead of inventing a new one.
+func EncodeClaim(helperShortID byte) []byte {
+	if helperShortID == 0 {
+		return nil
+	}
+	return []byte{helperShortID}
 }

@@ -64,6 +64,12 @@ public sealed class TunnelService : IDisposable
     private string _iamToken = "";
     private uint _nextStreamId;
 
+    // v5 security state: derived keys and the per-connection auth ticket that
+    // is appended to every upstream message except HELLO.
+    private SecureKeys? _keys;
+    private volatile byte[]? _ticket;
+    private long _rejected;
+
     // Short ID assigned by the cloud function to this helper (1..255). Stamped
     // into the top byte of every streamID we allocate so the adapter can route
     // per-stream frames back to us even when several helpers share the tunnel.
@@ -89,6 +95,12 @@ public sealed class TunnelService : IDisposable
     // Config
     public string BridgeUrl { get; set; } = "";
     public string AuthToken { get; set; } = "";
+    /// <summary>
+    /// Optional end-to-end key shared ONLY with the adapter (never with the
+    /// cloud function). When set, the cloud function / provider cannot read
+    /// stream data. Must match bridge.e2eKey in the adapter config.
+    /// </summary>
+    public string E2EKey { get; set; } = "";
     public string ListenAddress { get; set; } = "127.123.45.67";
     public int ListenPort { get; set; } = 5080;
     public bool Relay { get; set; }
@@ -187,6 +199,22 @@ public sealed class TunnelService : IDisposable
                 try { await previous.ConfigureAwait(false); } catch { }
             }
 
+            if (string.IsNullOrWhiteSpace(AuthToken) || AuthToken.Trim().Length < SecureKeys.MinSecretLen)
+            {
+                Log($"Auth token must be at least {SecureKeys.MinSecretLen} characters.");
+                OnStopped?.Invoke();
+                return;
+            }
+            if (!string.IsNullOrWhiteSpace(E2EKey) && E2EKey.Trim().Length < SecureKeys.MinSecretLen)
+            {
+                Log($"E2E key must be empty or at least {SecureKeys.MinSecretLen} characters.");
+                OnStopped?.Invoke();
+                return;
+            }
+            _keys = SecureKeys.Derive(AuthToken.Trim(), E2EKey?.Trim());
+            if (!_keys.E2E)
+                Log("WARNING: no E2E key set — stream data is authenticated, but the cloud function could decrypt it.");
+
             var cts = new CancellationTokenSource();
             _cts = cts;
             _stopping = false;
@@ -265,6 +293,9 @@ public sealed class TunnelService : IDisposable
         int delay = 1000;
         while (!ct.IsCancellationRequested)
         {
+            // Dispose a socket left over from a previous attempt that bailed out
+            // early (HELLO rejected / timed out) before reaching the cleanup below.
+            CloseUpstream();
             try
             {
                 Log($"Connecting to {BridgeUrl}...");
@@ -287,27 +318,48 @@ public sealed class TunnelService : IDisposable
                 await ws.ConnectAsync(bridgeUri, connCts.Token);
 
                 Log("WebSocket connected, sending HELLO...");
-                var hello = Protocol.Encode(Protocol.MsgHello, 0, Protocol.EncodeHello(0x01, AuthToken));
-                await WsSendUpstream(hello, ct);
+                // v5 HELLO proves knowledge of the auth token (timestamped HMAC);
+                // the token itself never goes over the wire.
+                var hello = Protocol.Encode(Protocol.MsgHello, 0,
+                    _keys!.HelloPayload(SecureKeys.RoleHelper, DateTimeOffset.UtcNow));
+                _ticket = null;
+                await WsSendUpstreamRaw(hello, ct);
 
                 Log("HELLO sent, waiting for HELLO_OK...");
-                var resp = await WsReceiveWithTimeout(TimeSpan.FromSeconds(10), ct);
+                // Other frames can overtake HELLO_OK; skip them until the deadline.
+                byte[]? resp = null;
+                var helloDeadline = DateTime.UtcNow + TimeSpan.FromSeconds(10);
+                while (DateTime.UtcNow < helloDeadline)
+                {
+                    var m = await WsReceiveWithTimeout(helloDeadline - DateTime.UtcNow, ct);
+                    if (m == null) break;
+                    if (m.Length >= 1 && (m[0] == Protocol.MsgHelloOK || m[0] == Protocol.MsgHelloErr)) { resp = m; break; }
+                }
                 if (resp == null) { Log("No HELLO response, retrying..."); continue; }
 
-                var (type, _, _, payload) = Protocol.Decode(resp);
-                if (type == Protocol.MsgHelloErr)
+                if (resp[0] == Protocol.MsgHelloErr)
                 {
-                    Log($"Auth rejected: {System.Text.Encoding.UTF8.GetString(payload)}");
+                    var reason = resp.Length > 9 ? System.Text.Encoding.UTF8.GetString(resp, 9, resp.Length - 9) : "auth failed";
+                    Log($"Auth rejected: {reason} (check auth token; clock must be within 5 min; cloud function must be v5)");
                     await Task.Delay(5000, ct);
                     continue;
                 }
-                if (type != Protocol.MsgHelloOK)
+                if (resp.Length < SecureKeys.HeaderLen + SecureKeys.TagLen)
                 {
-                    Log($"Unexpected response: {Protocol.MsgName(type)}, retrying...");
+                    Log("Malformed HELLO_OK, retrying...");
                     continue;
                 }
-
+                // The signature is bound to our own connection ID, which is in
+                // the (not yet verified) payload: decode, then verify with it.
+                var (_, _, _, payload) = Protocol.Decode(resp[..^SecureKeys.TagLen]);
                 var (ownId, peerId, iamToken, helperShortId) = Protocol.DecodeHelloOK(payload);
+                if (_keys.VerifyCtl(ownId, resp) == null)
+                {
+                    Log("HELLO_OK signature invalid (wrong auth token or forged response), retrying...");
+                    await Task.Delay(5000, ct);
+                    continue;
+                }
+                _ticket = _keys.Ticket(SecureKeys.RoleHelper, ownId);
                 _ownConnId = ownId;
                 _peerConnId = peerId;
                 _iamToken = iamToken;
@@ -349,7 +401,7 @@ public sealed class TunnelService : IDisposable
                     try
                     {
                         Log("HELLO_OK had no peer; sending proactive SYNC for discovery");
-                        await WsSendUpstream(Protocol.Encode(Protocol.MsgSync, 0), ct);
+                        await WsSendUpstream(ClaimFrame(Protocol.MsgSync), ct);
                     }
                     catch (Exception ex) { Log($"Proactive SYNC failed: {ex.Message}"); }
                 }
@@ -397,6 +449,7 @@ public sealed class TunnelService : IDisposable
             _ownConnId = "";
             _peerConnId = "";
             _iamToken = "";
+            _ticket = null;
             _helperShortId = 0;
             _probeRanThisCycle = false;
             EmitProbeStatus(ProbeStatus.Idle, "");
@@ -452,13 +505,52 @@ public sealed class TunnelService : IDisposable
 
                 var data = new byte[totalRead];
                 Buffer.BlockCopy(buffer, 0, data, 0, totalRead);
-                HandleFrame(data);
+                var plain = VerifyInbound(data);
+                if (plain == null)
+                {
+                    var n = Interlocked.Increment(ref _rejected);
+                    if (n <= 5 || n % 1000 == 0)
+                        Log($"Dropped unauthenticated message (len={data.Length}, total={n}) — forged frame or auth/E2E key mismatch");
+                    continue;
+                }
+                HandleFrame(plain);
             }
             catch (OperationCanceledException) { return; }
             catch (WebSocketException) { return; }
             catch (Exception ex) { Log($"Read error: {ex.Message}"); return; }
         }
     }
+
+    /// <summary>
+    /// Authenticates one upstream message and returns the plain frame, or null.
+    /// Control frames (streamID 0) must be signed by the cloud function; stream
+    /// frames must be sealed by the adapter, except OPEN_FAIL/RST synthesised
+    /// by the cloud function in relay mode (signed like control frames).
+    /// </summary>
+    private byte[]? VerifyInbound(byte[] msg)
+    {
+        var keys = _keys;
+        if (keys == null || msg.Length < SecureKeys.HeaderLen) return null;
+        var streamId = System.Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(msg.AsSpan(1));
+        if (streamId != 0)
+        {
+            var opened = keys.Open(SecureKeys.DirAdapterToHelper, msg);
+            if (opened != null) return opened;
+            if (msg[0] != Protocol.MsgOpenFail && msg[0] != Protocol.MsgRst) return null;
+        }
+        return keys.VerifyCtl(_ownConnId, msg);
+    }
+
+    /// <summary>Switches to the adapter-confirmed shortId (new streams only).</summary>
+    private void AdoptShortId(byte id)
+    {
+        if (id == 0 || id == _helperShortId) return;
+        Log($"Helper shortId changed {_helperShortId} -> {id} (confirmed by adapter)");
+        _helperShortId = id;
+    }
+
+    private byte[] ClaimFrame(byte type) =>
+        Protocol.Encode(type, 0, Protocol.EncodeClaim(_helperShortId));
 
     private void HandleFrame(byte[] data)
     {
@@ -469,21 +561,27 @@ public sealed class TunnelService : IDisposable
             switch (type)
             {
                 case Protocol.MsgPeerConn:
-                    var (peerId, iamToken) = Protocol.DecodePeerConn(payload);
+                    var (peerId, iamToken, confirmedShortId) = Protocol.DecodePeerConn(payload);
                     if (peerId == _staleConnId && peerId != "")
                     {
                         Log($"PEER_CONN with stale ID {Shorten(peerId)}, ignoring");
                         return;
                     }
-                    // Cancel pending opens from previous peer session
-                    CancelPendingOpens("new peer connected");
+                    // The cloud function re-announces the SAME adapter on every
+                    // adapter PING; only a genuinely new adapter connection
+                    // invalidates in-flight OPENs.
+                    bool changed;
                     lock (_peerLock)
                     {
+                        changed = _peerConnId != "" && _peerConnId != peerId;
+                        var wasEmpty = _peerConnId == "";
                         _staleConnId = "";
                         _peerConnId = peerId;
+                        if (wasEmpty || changed) Log($"Peer connected: {Shorten(peerId)}");
                     }
+                    if (changed) CancelPendingOpens("adapter reconnected");
                     if (iamToken != "") _iamToken = iamToken;
-                    Log($"Peer connected: {Shorten(peerId)}");
+                    AdoptShortId(confirmedShortId);
                     return;
 
                 case Protocol.MsgPeerGone:
@@ -507,8 +605,9 @@ public sealed class TunnelService : IDisposable
                     return;
 
                 case Protocol.MsgPong:
-                    var token = Protocol.DecodePong(payload);
+                    var (token, pongShortId) = Protocol.DecodePong(payload);
                     if (token != "") _iamToken = token;
+                    AdoptShortId(pongShortId);
                     return;
 
                 case Protocol.MsgPing:
@@ -1111,7 +1210,7 @@ public sealed class TunnelService : IDisposable
             try
             {
                 Log("Peer unknown, sending SYNC for discovery");
-                await WsSendUpstream(Protocol.Encode(Protocol.MsgSync, 0), ct);
+                await WsSendUpstream(ClaimFrame(Protocol.MsgSync), ct);
             }
             catch { }
         }
@@ -1352,8 +1451,12 @@ public sealed class TunnelService : IDisposable
 
     // --- Send to peer ---
 
-    private async Task<string?> SendToPeerAsync(byte[] frame)
+    private async Task<string?> SendToPeerAsync(byte[] plainFrame)
     {
+        // Every stream frame is sealed for the adapter (encrypted + MAC'd).
+        var keys = _keys;
+        if (keys == null) return "not started";
+        var frame = keys.Seal(SecureKeys.DirHelperToAdapter, plainFrame);
         if (Relay)
         {
             // Relay mode: send through upstream WS
@@ -1388,7 +1491,7 @@ public sealed class TunnelService : IDisposable
             Log($"wsSend: peer gone (404) peer={Shorten(peer)}, marked stale, sending SYNC");
             try
             {
-                await WsSendUpstream(Protocol.Encode(Protocol.MsgSync, 0), _cts?.Token ?? CancellationToken.None);
+                await WsSendUpstream(ClaimFrame(Protocol.MsgSync), _cts?.Token ?? CancellationToken.None);
             }
             catch { }
             return ex.Message;
@@ -1421,6 +1524,18 @@ public sealed class TunnelService : IDisposable
 
     private static readonly HttpClient _http = new() { Timeout = TimeSpan.FromSeconds(10) };
 
+    // Test hook: BTF_TEST_WSAPI_REST points wsSend at a local fake API
+    // (tests/e2e). Honoured only for loopback URLs, so it can never send the
+    // IAM token to a remote host in clear text.
+    private static readonly string WsApiBase = ResolveWsApiBase();
+    private static string ResolveWsApiBase()
+    {
+        var t = Environment.GetEnvironmentVariable("BTF_TEST_WSAPI_REST");
+        if (!string.IsNullOrEmpty(t) && Uri.TryCreate(t, UriKind.Absolute, out var u) && u.IsLoopback)
+            return t.TrimEnd('/');
+        return "https://apigateway-connections.api.cloud.yandex.net";
+    }
+
     private async Task WsSendApi(string connId, byte[] data, string iamToken)
     {
         if (Relay)
@@ -1428,7 +1543,7 @@ public sealed class TunnelService : IDisposable
 
         var b64 = Convert.ToBase64String(data);
         var json = $"{{\"data\":\"{b64}\",\"type\":\"BINARY\"}}";
-        var url = $"https://apigateway-connections.api.cloud.yandex.net/apigateways/websocket/v1/connections/{Uri.EscapeDataString(connId)}:send";
+        var url = $"{WsApiBase}/apigateways/websocket/v1/connections/{Uri.EscapeDataString(connId)}:send";
 
         using var req = new HttpRequestMessage(HttpMethod.Post, url);
         req.Content = new StringContent(json, System.Text.Encoding.UTF8, "application/json");
@@ -1456,7 +1571,22 @@ public sealed class TunnelService : IDisposable
 
     // --- Upstream WS helpers ---
 
-    private async Task WsSendUpstream(byte[] data, CancellationToken ct)
+    /// <summary>
+    /// Sends a message on the upstream WS with this connection's auth ticket
+    /// appended. The cloud function drops (and disconnects) anything without a
+    /// valid ticket.
+    /// </summary>
+    private Task WsSendUpstream(byte[] data, CancellationToken ct)
+    {
+        var t = _ticket;
+        if (t == null) throw new InvalidOperationException("upstream not authenticated");
+        var msg = new byte[data.Length + t.Length];
+        Buffer.BlockCopy(data, 0, msg, 0, data.Length);
+        Buffer.BlockCopy(t, 0, msg, data.Length, t.Length);
+        return WsSendUpstreamRaw(msg, ct);
+    }
+
+    private async Task WsSendUpstreamRaw(byte[] data, CancellationToken ct)
     {
         var ws = _upstream;
         if (ws == null || ws.State != WebSocketState.Open)
@@ -1526,7 +1656,7 @@ public sealed class TunnelService : IDisposable
                 // and we don't need to keep the cloud function warm; the WS may
                 // idle out and reconnect on demand.
                 if (!Relay && string.IsNullOrEmpty(_peerConnId)) continue;
-                await WsSendUpstream(Protocol.Encode(Protocol.MsgPing, 0), ct);
+                await WsSendUpstream(ClaimFrame(Protocol.MsgPing), ct);
             }
         }
         catch (OperationCanceledException) { }

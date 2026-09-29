@@ -52,13 +52,15 @@ Client ◄──TCP── Helper ◄──WS────────── API G
 
 > This is a proof-of-concept and a messy hobby project. No guarantees of any kind. The wire protocol, configuration format and APIs can change at any time - sometimes every day. Whenever you pull a new revision, ALWAYS update all three components together: Cloud Function (`bridge-cloud/`), adapter, and helper / MAUI app. Mixing versions across these components will almost certainly break the tunnel in subtle and frustrating ways.
 
+> **v5: security.** Since v5 every message is authenticated, function frames are signed, and helper↔adapter traffic is encrypted (with `e2eKey`, so that not even the cloud function can read it). In v4 anyone who knew the gateway URL could obtain the service account's IAM token and use your tunnel. **Update all components together** and read [SECURITY.md](SECURITY.md).
+
 ## Installation overview
 
 Three pieces need to be in place. Detailed configuration for each lives in its own section below; here is the high-level order:
 
 1. **Adapter** — build it (see [Adapter / Build](#build)) and run it on a remote server, ideally next to whatever you ultimately proxy through (Dante / XRay-core / etc.). It must expose its HTTP recovery endpoint to the public internet so the Serverless Function can reach it on cold start (default path `/conn-ids`, configurable via `http.path` — see [Customizing endpoint paths](#customizing-endpoint-paths)).
 2. **Cloud Function** — deploy [`bridge-cloud/`](bridge-cloud/) to Yandex Cloud Functions and bind it to an API Gateway. Set the `HTTP_URL` env var to the **full** URL of the adapter's HTTP recovery endpoint (e.g. `https://<server>:<port>/conn-ids`, or whatever path you set in the adapter's `http.path`), and use the same `AUTH_TOKEN` shared secret on all three components. Don't forget to obfuscate the JS before uploading (see notice above).
-3. **Client** — configure the Go helper or the MAUI app with the same `bridge.url` (the API Gateway URL ending in `/_helper`) and `authToken`. Start it, point your apps at the helper's local listen port, and you're done.
+3. **Client** — configure the Go helper or the MAUI app with the same `bridge.url` (the API Gateway URL ending in `/_helper`), `authToken` and `e2eKey` (a second secret shared **only** by the adapter and helpers; never give it to the function). Start it, point your apps at the helper's local listen port, and you're done.
 
 ## How it works
 
@@ -155,6 +157,7 @@ Create `adapter.config.yaml`:
 bridge:
   url: "wss://<api-gateway-domain>/_adapter"
   authToken: "<shared-secret>"
+  e2eKey: "<second-secret-adapter-and-helpers-only>"
   reconnect:
     initialDelayMs: 1000
     maxDelayMs: 30000
@@ -182,7 +185,8 @@ logging:
 | Key | Description |
 |------|----------|
 | `bridge.url` | WebSocket URL of the API Gateway endpoint for the adapter |
-| `bridge.authToken` | Shared secret (must match `AUTH_TOKEN` in the Cloud Function) |
+| `bridge.authToken` | Shared secret (must match `AUTH_TOKEN` in the Cloud Function), at least 16 characters |
+| `bridge.e2eKey` | End-to-end key, identical on the adapter and every helper and **not** given to the function. At least 16 characters, different from `authToken`. Strongly recommended — see [SECURITY.md](SECURITY.md) |
 | `bridge.reconnect` | Exponential backoff for upstream reconnects |
 | `bridge.pingIntervalMs` | PING interval to prevent idle disconnect (keep under 10 min) |
 | `target.address` | TCP address of the target service |
@@ -202,7 +206,7 @@ logging:
 
 | Endpoint | Method | Description |
 |-----------|-------|----------|
-| `http.path` (default `/conn-ids`) | GET | Returns `{"adapterConnId":"...","helperConnId":"..."}`. Authorization: `Bearer <authToken>`. |
+| `http.path` (default `/conn-ids`) | GET | Returns the connection IDs; the response is signed (`X-BTF-Sig`). Authorization: `BTF5 <ts>.<hmac>` (timestamped HMAC keyed from `authToken`; the secret itself is never sent). Without a valid signature it answers `404`. |
 
 ---
 
@@ -227,6 +231,7 @@ Create `helper.config.yaml`:
 bridge:
   url: "wss://<api-gateway-domain>/_helper"
   authToken: "<shared-secret>"
+  e2eKey: "<second-secret-adapter-and-helpers-only>"
   reconnect:
     initialDelayMs: 1000
     maxDelayMs: 30000
@@ -274,6 +279,8 @@ Clients connect to `listen.address` over plain TCP. Each connection is tunneled 
 - A folder in the cloud for the project
 
 ### 1. Create a service account
+
+> Authenticated adapters and helpers receive this account's IAM token. Put everything for the bridge in a **dedicated folder** that contains nothing else, and grant the account no other roles.
 
 ```bash
 yc iam service-account create --name bridge-sa
@@ -369,7 +376,8 @@ yc serverless function version create \
 
 | Variable | Required | Description |
 |------------|-------------|----------|
-| `AUTH_TOKEN` | Yes | Shared secret (same value as `bridge.authToken`) |
+| `AUTH_TOKEN` | Yes | Shared secret (same value as `bridge.authToken`), at least 16 characters. Do **not** put `e2eKey` here |
+| `LOG_LEVEL` | No | `debug` logs every frame; default logs only state changes and security events |
 | `HTTP_URL` | Yes | Full URL of the adapter's HTTP recovery endpoint, including the path (e.g. `https://your-server:3001/conn-ids`, or whatever you set for `http.path` in the adapter config). Used to fetch connection IDs on cold start; needed to restore state across multiple instances. |
 
 ### 3. Create the API Gateway

@@ -22,7 +22,7 @@ public partial class MainPage : ContentPage
 
         // Load saved settings
         BridgeUrlEntry.Text = Preferences.Default.Get("BridgeUrl", "wss://");
-        AuthTokenEntry.Text = Preferences.Default.Get("AuthToken", "");
+        LoadSecrets();
         ListenAddressEntry.Text = Preferences.Default.Get("ListenAddress", "127.123.45.67");
         ListenPortEntry.Text = Preferences.Default.Get("ListenPort", "5080");
         RelaySwitch.IsToggled = Preferences.Default.Get("Relay", false);
@@ -37,6 +37,53 @@ public partial class MainPage : ContentPage
             OnPropertyChanged(nameof(IsNotRunning));
             _tunnel.OnStopped += OnTunnelStopped;
             AddLog("[resumed — tunnel is running in background]");
+        }
+    }
+
+    // Secrets live in the platform keystore (SecureStorage) instead of plain
+    // Preferences. SecureStorage isn't implemented on every head (e.g. the
+    // Linux GTK preview), so fall back to Preferences there. Values saved in
+    // Preferences by older versions are migrated on first load.
+    private const string KeyAuth = "AuthToken";
+    private const string KeyE2E = "E2EKey";
+
+    private async void LoadSecrets()
+    {
+        AuthTokenEntry.Text = await ReadSecret(KeyAuth);
+        E2EKeyEntry.Text = await ReadSecret(KeyE2E);
+    }
+
+    private static async Task<string> ReadSecret(string key)
+    {
+        try
+        {
+            var v = await SecureStorage.Default.GetAsync(key);
+            if (!string.IsNullOrEmpty(v)) return v;
+            var legacy = Preferences.Default.Get(key, "");
+            if (!string.IsNullOrEmpty(legacy))
+            {
+                await SecureStorage.Default.SetAsync(key, legacy);
+                Preferences.Default.Remove(key);
+            }
+            return legacy;
+        }
+        catch
+        {
+            return Preferences.Default.Get(key, "");
+        }
+    }
+
+    private static async Task WriteSecret(string key, string value)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(value)) SecureStorage.Default.Remove(key);
+            else await SecureStorage.Default.SetAsync(key, value);
+            Preferences.Default.Remove(key);
+        }
+        catch
+        {
+            Preferences.Default.Set(key, value);
         }
     }
 
@@ -55,13 +102,15 @@ public partial class MainPage : ContentPage
             var bridgeUri = new Uri(url);
             var qs = HttpUtility.ParseQueryString("");
             qs["token"] = AuthTokenEntry.Text?.Trim() ?? "";
+            var e2e = E2EKeyEntry.Text?.Trim() ?? "";
+            if (e2e != "") qs["e2e"] = e2e;
             qs["listen"] = $"{ListenAddressEntry.Text?.Trim()}:{ListenPortEntry.Text?.Trim()}";
             if (RelaySwitch.IsToggled) qs["relay"] = "1";
             if (CoalesceSwitch.IsToggled) qs["coalesce"] = "1";
 
             var btfUrl = $"btf://{bridgeUri.Host}{bridgeUri.AbsolutePath}?{qs}";
             await Clipboard.Default.SetTextAsync(btfUrl);
-            AddLog($"Config exported to clipboard");
+            AddLog("Config exported to clipboard. It contains your secrets — share it only over a private channel and clear the clipboard afterwards.");
         }
         catch (Exception ex)
         {
@@ -86,6 +135,7 @@ public partial class MainPage : ContentPage
 
             BridgeUrlEntry.Text = $"wss://{uri.Host}{uri.AbsolutePath}";
             AuthTokenEntry.Text = qs["token"] ?? "";
+            E2EKeyEntry.Text = qs["e2e"] ?? "";
 
             var listen = qs["listen"] ?? "";
             var colonIdx = listen.LastIndexOf(':');
@@ -123,6 +173,7 @@ public partial class MainPage : ContentPage
         // Validate
         var url = BridgeUrlEntry.Text?.Trim();
         var token = AuthTokenEntry.Text?.Trim();
+        var e2eKey = E2EKeyEntry.Text?.Trim() ?? "";
         var addr = ListenAddressEntry.Text?.Trim();
         var portStr = ListenPortEntry.Text?.Trim();
 
@@ -131,9 +182,14 @@ public partial class MainPage : ContentPage
             await DisplayAlertAsync("Error", "Bridge URL must start with wss://", "OK");
             return;
         }
-        if (string.IsNullOrEmpty(token))
+        if (string.IsNullOrEmpty(token) || token.Length < Services.SecureKeys.MinSecretLen)
         {
-            await DisplayAlertAsync("Error", "Auth token is required", "OK");
+            await DisplayAlertAsync("Error", $"Auth token is required (at least {Services.SecureKeys.MinSecretLen} characters)", "OK");
+            return;
+        }
+        if (e2eKey != "" && (e2eKey.Length < Services.SecureKeys.MinSecretLen || e2eKey == token))
+        {
+            await DisplayAlertAsync("Error", $"E2E key must be at least {Services.SecureKeys.MinSecretLen} characters and differ from the auth token", "OK");
             return;
         }
         if (!int.TryParse(portStr, out var port) || port < 1 || port > 65535)
@@ -144,6 +200,7 @@ public partial class MainPage : ContentPage
 
         _tunnel.BridgeUrl = url;
         _tunnel.AuthToken = token;
+        _tunnel.E2EKey = e2eKey;
         _tunnel.ListenAddress = addr ?? "127.123.45.67";
         _tunnel.ListenPort = port;
         _tunnel.Relay = RelaySwitch.IsToggled;
@@ -151,7 +208,8 @@ public partial class MainPage : ContentPage
 
         // Save settings
         Preferences.Default.Set("BridgeUrl", url);
-        Preferences.Default.Set("AuthToken", token);
+        await WriteSecret(KeyAuth, token);
+        await WriteSecret(KeyE2E, e2eKey);
         Preferences.Default.Set("ListenAddress", addr ?? "127.123.45.67");
         Preferences.Default.Set("ListenPort", portStr!);
         Preferences.Default.Set("Relay", RelaySwitch.IsToggled);

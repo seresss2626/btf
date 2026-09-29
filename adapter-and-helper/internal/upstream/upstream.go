@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"log"
 	"net"
@@ -10,6 +11,7 @@ import (
 
 	"github.com/bridge-to-freedom/adapter/internal/config"
 	"github.com/bridge-to-freedom/adapter/internal/protocol"
+	"github.com/bridge-to-freedom/adapter/internal/secure"
 	"github.com/gorilla/websocket"
 )
 
@@ -21,12 +23,22 @@ type Upstream struct {
 	cfg     *config.Config
 	handler FrameHandler
 
-	mu          sync.Mutex
-	writeMu     sync.Mutex // serializes all WebSocket writes
-	conn        *websocket.Conn
-	running     bool
-	ownConnID   string
-	iamToken    string
+	// Security (v5). role is "adapter" or "helper"; peerDir is the direction
+	// tag expected on sealed stream frames arriving from the peer.
+	role    string
+	keys    *secure.Keys
+	peerDir byte
+
+	mu        sync.Mutex
+	writeMu   sync.Mutex // serializes all WebSocket writes
+	conn      *websocket.Conn
+	running   bool
+	ownConnID string
+	ticket    []byte // per-connection auth ticket appended to every upstream write
+	iamToken  string
+
+	// Counts dropped unauthenticated inbound messages (logged sparsely).
+	rejected uint64
 
 	// Helper-side state (single adapter peer).
 	peerConnID    string
@@ -38,13 +50,73 @@ type Upstream struct {
 	helperStale map[byte]string // shortID -> last failed connID (rejects stale PEER_CONN)
 }
 
-func New(cfg *config.Config, handler FrameHandler) *Upstream {
+// New creates an upstream. role is secure.RoleAdapter or secure.RoleHelper.
+func New(cfg *config.Config, role string, keys *secure.Keys, handler FrameHandler) *Upstream {
+	peerDir := secure.DirAdapterToHelper
+	if role == secure.RoleAdapter {
+		peerDir = secure.DirHelperToAdapter
+	}
 	return &Upstream{
 		cfg:         cfg,
 		handler:     handler,
+		role:        role,
+		keys:        keys,
+		peerDir:     peerDir,
 		helpers:     make(map[byte]string),
 		helperStale: make(map[byte]string),
 	}
+}
+
+// writeWithTicket appends this connection's auth ticket and writes one binary
+// message. Every upstream write except HELLO must go through here: the cloud
+// function drops any message without a valid ticket.
+func (u *Upstream) writeWithTicket(c *websocket.Conn, data []byte) error {
+	u.mu.Lock()
+	t := u.ticket
+	u.mu.Unlock()
+	if t == nil {
+		return fmt.Errorf("upstream not authenticated")
+	}
+	msg := make([]byte, 0, len(data)+len(t))
+	msg = append(append(msg, data...), t...)
+	u.writeMu.Lock()
+	defer u.writeMu.Unlock()
+	c.SetWriteDeadline(time.Now().Add(writeTimeout))
+	return c.WriteMessage(websocket.BinaryMessage, msg)
+}
+
+// writeTimeout bounds a single upstream write so a stalled socket can't wedge
+// every sender (all writes share writeMu).
+const writeTimeout = 15 * time.Second
+
+// verifyInbound authenticates one message from the upstream WS and returns
+// the plain frame. Control frames (streamID 0) must be signed by the cloud
+// function; stream frames must be sealed by the peer, except OPEN_FAIL/RST
+// synthesised by the cloud function in relay mode (signed like control).
+func (u *Upstream) verifyInbound(msg []byte) (protocol.Frame, bool) {
+	if len(msg) < secure.HeaderLen {
+		return protocol.Frame{}, false
+	}
+	u.mu.Lock()
+	own := u.ownConnID
+	u.mu.Unlock()
+
+	streamID := binary.BigEndian.Uint32(msg[1:5])
+	if streamID != 0 {
+		if plain, ok := u.keys.Open(u.peerDir, msg); ok {
+			f, err := protocol.Decode(plain)
+			return f, err == nil
+		}
+		if msg[0] != protocol.MsgOpenFail && msg[0] != protocol.MsgRst {
+			return protocol.Frame{}, false
+		}
+	}
+	frame, ok := u.keys.VerifyCtl(own, msg)
+	if !ok {
+		return protocol.Frame{}, false
+	}
+	f, err := protocol.Decode(frame)
+	return f, err == nil
 }
 
 // OwnConnID returns this side's upstream connection ID.
@@ -90,15 +162,18 @@ func (u *Upstream) Send(data []byte) error {
 	if c == nil {
 		return fmt.Errorf("upstream not connected")
 	}
-	u.writeMu.Lock()
-	err := c.WriteMessage(websocket.BinaryMessage, data)
-	u.writeMu.Unlock()
-	return err
+	return u.writeWithTicket(c, data)
 }
 
 // SendSync sends a SYNC frame through the upstream WS.
 func (u *Upstream) SendSync() error {
-	return u.Send(protocol.Encode(protocol.Frame{Type: protocol.MsgSync}))
+	return u.Send(u.claimFrame(protocol.MsgSync))
+}
+
+// claimFrame builds a PING/SYNC frame carrying our helper short ID claim
+// (empty payload on the adapter).
+func (u *Upstream) claimFrame(t byte) []byte {
+	return protocol.Encode(protocol.Frame{Type: t, Payload: protocol.EncodeClaim(u.HelperShortID())})
 }
 
 // MarkPeerStale clears the peer connection ID and triggers a SYNC, but only if
@@ -163,10 +238,45 @@ func (u *Upstream) Helper(shortID byte) string {
 // SetHelper records a helper's connID under its short ID (adapter-side).
 func (u *Upstream) SetHelper(shortID byte, connID string) {
 	u.mu.Lock()
+	// One connection has exactly one short ID: drop older slots for it.
+	for sid, cid := range u.helpers {
+		if cid == connID && sid != shortID {
+			delete(u.helpers, sid)
+		}
+	}
 	u.helpers[shortID] = connID
 	// A fresh announcement clears any prior staleness for this slot.
 	delete(u.helperStale, shortID)
 	u.mu.Unlock()
+}
+
+// AssignHelper returns the short ID for a helper connection (adapter-side).
+// The adapter is the single authority for short IDs: serverless function
+// instances don't share memory and used to hand out colliding IDs. A known
+// helper keeps its ID; a new one gets `want` (the ID it already stamps into
+// its streams) if that is free, otherwise the lowest free ID. Returns 0 if all
+// 255 are in use.
+func (u *Upstream) AssignHelper(connID string, want byte) byte {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	for sid, cid := range u.helpers {
+		if cid == connID {
+			return sid
+		}
+	}
+	if _, used := u.helpers[want]; want != 0 && !used {
+		u.helpers[want] = connID
+		delete(u.helperStale, want)
+		return want
+	}
+	for sid := 1; sid <= 255; sid++ {
+		if _, used := u.helpers[byte(sid)]; !used {
+			u.helpers[byte(sid)] = connID
+			delete(u.helperStale, byte(sid))
+			return byte(sid)
+		}
+	}
+	return 0
 }
 
 // RemoveHelper drops a helper by short ID (adapter-side). Returns the removed
@@ -248,45 +358,63 @@ func (u *Upstream) dial(ctx context.Context) (*websocket.Conn, error) {
 	}
 	log.Printf("[INFO] WebSocket connected, sending HELLO...")
 
-	// HELLO
+	// HELLO (v5): proves knowledge of authToken without sending it.
 	hello := protocol.Encode(protocol.Frame{
 		Type:    protocol.MsgHello,
-		Payload: protocol.EncodeHello(0x01, u.cfg.Bridge.AuthToken),
+		Payload: u.keys.HelloPayload(u.role, time.Now()),
 	})
+	ws.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if err := ws.WriteMessage(websocket.BinaryMessage, hello); err != nil {
 		ws.Close()
 		return nil, fmt.Errorf("send HELLO: %w", err)
 	}
 
+	// Wait for HELLO_OK / HELLO_ERR. Other frames (e.g. a PEER_CONN pushed
+	// by another function invocation that already learned our connection ID)
+	// can overtake the HELLO response; skip them instead of failing.
 	ws.SetReadDeadline(time.Now().Add(10 * time.Second))
-	_, msg, err := ws.ReadMessage()
-	ws.SetReadDeadline(time.Time{}) // clear deadline
-	if err != nil {
-		ws.Close()
-		return nil, fmt.Errorf("read HELLO response (timeout?): %w", err)
+	var msg []byte
+	for {
+		_, m, err := ws.ReadMessage()
+		if err != nil {
+			ws.Close()
+			return nil, fmt.Errorf("read HELLO response (timeout?): %w", err)
+		}
+		if len(m) >= 1 && m[0] == protocol.MsgHelloErr {
+			ws.Close()
+			reason := "auth failed"
+			if len(m) > secure.HeaderLen {
+				reason = string(m[secure.HeaderLen:])
+			}
+			return nil, fmt.Errorf("rejected by cloud function: %q (authToken mismatch, clock skew > %v, or outdated cloud function)", reason, secure.MaxClockSkew)
+		}
+		if len(m) >= secure.HeaderLen+secure.TagLen && m[0] == protocol.MsgHelloOK {
+			msg = m
+			break
+		}
+		log.Printf("[DEBUG] skipping frame type=0x%02x while waiting for HELLO_OK", m[0])
 	}
-	resp, err := protocol.Decode(msg)
+	ws.SetReadDeadline(time.Time{}) // clear deadline
+	// The signature is bound to our own connection ID, which is inside the
+	// (not yet verified) payload: decode first, then verify with it.
+	resp, err := protocol.Decode(msg[:len(msg)-secure.TagLen])
 	if err != nil {
 		ws.Close()
 		return nil, err
 	}
-	if resp.Type == protocol.MsgHelloErr {
-		ws.Close()
-		return nil, fmt.Errorf("rejected: %s", string(resp.Payload))
-	}
-	if resp.Type != protocol.MsgHelloOK {
-		ws.Close()
-		return nil, fmt.Errorf("unexpected response: 0x%02x", resp.Type)
-	}
-
 	ownID, peerID, iamToken, helperShortID, err := protocol.DecodeHelloOK(resp.Payload)
 	if err != nil {
 		ws.Close()
 		return nil, fmt.Errorf("decode HELLO_OK: %w", err)
 	}
+	if _, ok := u.keys.VerifyCtl(ownID, msg); !ok {
+		ws.Close()
+		return nil, fmt.Errorf("HELLO_OK signature invalid (authToken mismatch or forged response)")
+	}
 
 	u.mu.Lock()
 	u.ownConnID = ownID
+	u.ticket = u.keys.Ticket(u.role, ownID)
 	u.peerConnID = peerID
 	u.iamToken = iamToken
 	u.helperShortID = helperShortID // 0 on adapter, 1..255 on helper
@@ -320,9 +448,14 @@ func (u *Upstream) readLoop(ctx context.Context) {
 		if msgType != websocket.BinaryMessage {
 			continue
 		}
-		f, err := protocol.Decode(msg)
-		if err != nil {
-			log.Printf("[DEBUG] bad upstream frame: %v", err)
+		f, ok := u.verifyInbound(msg)
+		if !ok {
+			u.rejected++
+			// Log the first few and then sparsely: a flood of forged frames
+			// must not turn into a flood of log lines.
+			if u.rejected <= 5 || u.rejected%1000 == 0 {
+				log.Printf("[WARN] dropped unauthenticated upstream message (len=%d, total dropped=%d) — forged frame, or authToken/e2eKey mismatch between components", len(msg), u.rejected)
+			}
 			continue
 		}
 		u.handler(f)
@@ -355,10 +488,9 @@ func (u *Upstream) pingLoop(ctx context.Context, interval time.Duration) {
 				continue
 			}
 			log.Printf("[DEBUG] sending PING")
-			f := protocol.Encode(protocol.Frame{Type: protocol.MsgPing})
-			u.writeMu.Lock()
-			c.WriteMessage(websocket.BinaryMessage, f)
-			u.writeMu.Unlock()
+			if err := u.writeWithTicket(c, u.claimFrame(protocol.MsgPing)); err != nil {
+				log.Printf("[WARN] PING send failed: %v", err)
+			}
 		}
 	}
 }
@@ -422,11 +554,9 @@ func (u *Upstream) Run(ctx context.Context) {
 		// Send an immediate PING to force the cloud function to cross-notify
 		// the peer of our connId. Without this, discovery depends on the
 		// periodic PING (30s default) and the peer may time out waiting.
-		{
-			f := protocol.Encode(protocol.Frame{Type: protocol.MsgPing})
-			u.writeMu.Lock()
-			ws.WriteMessage(websocket.BinaryMessage, f)
-			u.writeMu.Unlock()
+		if err := u.writeWithTicket(ws, u.claimFrame(protocol.MsgPing)); err != nil {
+			log.Printf("[WARN] initial PING failed: %v", err)
+		} else {
 			log.Println("[DEBUG] sent initial PING for fast discovery")
 		}
 
@@ -447,11 +577,9 @@ func (u *Upstream) Run(ctx context.Context) {
 		needSync := u.peerConnID == "" && !u.cfg.WsAPI.Relay
 		u.mu.Unlock()
 		if needSync {
-			f := protocol.Encode(protocol.Frame{Type: protocol.MsgSync})
-			u.writeMu.Lock()
-			ws.WriteMessage(websocket.BinaryMessage, f)
-			u.writeMu.Unlock()
-			log.Println("[DEBUG] HELLO_OK had no peer; sent proactive SYNC")
+			if err := u.writeWithTicket(ws, u.claimFrame(protocol.MsgSync)); err == nil {
+				log.Println("[DEBUG] HELLO_OK had no peer; sent proactive SYNC")
+			}
 		}
 
 		readCtx, readCancel := context.WithCancel(ctx)
@@ -471,6 +599,7 @@ func (u *Upstream) Run(ctx context.Context) {
 		u.mu.Lock()
 		u.conn = nil
 		u.ownConnID = ""
+		u.ticket = nil
 		u.peerConnID = ""
 		u.iamToken = ""
 		u.helperShortID = 0

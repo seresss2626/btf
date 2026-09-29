@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- TEST-ONLY: compiles the MAUI client's platform-independent services
+       (Protocol, Secure, TunnelService) on plain .NET and checks the crypto
+       against testdata/vectors.json. Run: dotnet run -c Release -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../maui-client/Services/Protocol.cs" />
+    <Compile Include="../../maui-client/Services/Secure.cs" />
+    <Compile Include="../../maui-client/Services/TunnelService.cs" />
+  </ItemGroup>
+</Project>

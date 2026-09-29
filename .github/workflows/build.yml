@@ -14,6 +14,40 @@ env:
 
 jobs:
   # ---------------------------------------------------------------------------
+  # Tests: crypto vectors (Go/JS/C#), cloud-function attack tests, and a local
+  # end-to-end run (API Gateway simulator + real function, adapter, helpers
+  # and the MAUI client services), including attack scenarios.
+  # ---------------------------------------------------------------------------
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+          cache-dependency-path: adapter-and-helper/go.sum
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+      - name: Go vet + unit tests
+        working-directory: adapter-and-helper
+        run: go vet ./... && go test ./...
+      - name: Cloud function tests
+        run: node --test tests/cloud-function.test.js
+      - name: MAUI services crypto vectors
+        run: dotnet run -c Release --project tests/maui-services
+      - name: End-to-end (simulated Yandex Cloud)
+        run: |
+          (cd tests/e2e && npm install --no-audit --no-fund)
+          SIM_INSTANCES=3 START_ORDER=adapter-first tests/e2e/run.sh
+          SIM_INSTANCES=3 START_ORDER=helpers-first SKIP_MAUI=1 tests/e2e/run.sh
+
+  # ---------------------------------------------------------------------------
   # Go: adapter + helper for linux/amd64, linux/arm64, windows/amd64
   # ---------------------------------------------------------------------------
   build-go:

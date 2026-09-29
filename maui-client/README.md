@@ -76,7 +76,7 @@ Install the GTK4 / libadwaita / WebKitGTK runtime libs (the GTK4 backend P/Invok
 ## Usage
 
 1. Enter **Bridge URL** — the helper endpoint of the API Gateway (e.g. `wss://gateway.example.com/_helper`)
-2. Enter **Auth Token** — the shared secret matching the adapter and Cloud Function
+2. Enter **Auth Token** — the shared secret matching the adapter and Cloud Function — and **E2E Key**, the end-to-end key matching the adapter's `bridge.e2eKey` (never given to the function). Both are kept in the platform secret store
 3. Set **Listen Address** and **Port** — where clients should connect (default `127.123.45.67:5080`). If you want to share the tunnel with other devices on your local network, change the address to `0.0.0.0` manually so the listener binds on all interfaces.
 4. If your device cannot reach the `wsSend` API directly, enable **Relay mode**. Recommendation: don't enable relay mode unless you have to — only use it if direct mode doesn't work for you. Direct mode is faster and more stable.
 5. Press **CONNECT**
