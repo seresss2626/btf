@@ -268,6 +268,53 @@ jobs:
   # ---------------------------------------------------------------------------
   # Release: attach all artifacts on tag pushes
   # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # MAUI iOS: UNSIGNED .ipa (experimental). Install it by re-signing with your
+  # own Apple ID (e.g. Sideloadly / AltStore) — see maui-client/README*.md.
+  # ---------------------------------------------------------------------------
+  build-maui-ios:
+    name: MAUI iOS (unsigned IPA, experimental)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Select newest Xcode
+        run: |
+          XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
+          echo "Using $XC"
+          sudo xcode-select -s "$XC"
+          xcodebuild -version
+
+      - name: Restore MAUI workloads
+        working-directory: maui-client
+        run: dotnet workload restore BridgeToFreedom.csproj --ignore-failed-sources
+
+      - name: Build for device without code signing
+        working-directory: maui-client
+        run: |
+          dotnet build BridgeToFreedom.csproj -f net10.0-ios -c Release \
+            -p:RuntimeIdentifier=ios-arm64 -p:EnableCodeSigning=false
+
+      - name: Package unsigned IPA
+        working-directory: maui-client
+        run: |
+          APP=$(find bin/Release/net10.0-ios -type d -name '*.app' | head -1)
+          test -n "$APP" || { echo "no .app produced"; exit 1; }
+          mkdir -p out/Payload
+          cp -R "$APP" out/Payload/
+          (cd out && zip -qry BridgeToFreedom-ios-unsigned.ipa Payload)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: maui-ios-unsigned
+          path: maui-client/out/BridgeToFreedom-ios-unsigned.ipa
+          if-no-files-found: error
+
   release:
     name: Release
     if: startsWith(github.ref, 'refs/tags/v')
