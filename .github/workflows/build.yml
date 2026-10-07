@@ -284,7 +284,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-maui-ios:
     name: MAUI iOS (unsigned IPA, experimental)
-    runs-on: macos-15
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
 
@@ -294,10 +294,12 @@ jobs:
 
       - name: Select newest Xcode
         run: |
+          ls -d /Applications/Xcode*.app
           XC=$(ls -d /Applications/Xcode_*.app | sort -V | tail -1)
           echo "Using $XC"
           sudo xcode-select -s "$XC"
           xcodebuild -version
+          echo "::notice title=Xcode::$(xcodebuild -version | tr '\n' ' ') / available: $(ls -d /Applications/Xcode_*.app | xargs -n1 basename | tr '\n' ' ')"
 
       - name: Restore MAUI workloads
         working-directory: maui-client
@@ -308,7 +310,7 @@ jobs:
         run: |
           set -o pipefail
           dotnet build BridgeToFreedom.csproj -f net10.0-ios -c Release \
-            -p:RuntimeIdentifier=ios-arm64 -p:EnableCodeSigning=false 2>&1 | tee build.log || {
+            -p:RuntimeIdentifier=ios-arm64 -p:EnableCodeSigning=false -p:ValidateXcodeVersion=false 2>&1 | tee build.log || {
             ../.github/annotate.sh "iOS build failed" build.log; exit 1; }
 
       - name: Package unsigned IPA
