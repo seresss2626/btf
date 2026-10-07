@@ -309,9 +309,20 @@ jobs:
         working-directory: maui-client
         run: |
           set -o pipefail
-          dotnet build BridgeToFreedom.csproj -f net10.0-ios -c Release \
-            -p:RuntimeIdentifier=ios-arm64 -p:EnableCodeSigning=false -p:ValidateXcodeVersion=false 2>&1 | tee build.log || {
-            ../.github/annotate.sh "iOS build failed" build.log; exit 1; }
+          # The newest .NET iOS SDK may need a newer Xcode than the runner has;
+          # fall back to an iOS 26.x SDK that matches the installed Xcode 26.
+          ok=0
+          for tfm in net10.0-ios net10.0-ios26.5 net10.0-ios26.4 net10.0-ios26.2 net10.0-ios26.0; do
+            echo "=== trying $tfm"
+            rm -rf bin obj
+            if dotnet build BridgeToFreedom.csproj -f $tfm -c Release -p:IosTfm=$tfm \
+                 -p:RuntimeIdentifier=ios-arm64 -p:EnableCodeSigning=false -p:ValidateXcodeVersion=false \
+                 2>&1 | tee build-$tfm.log; then
+              echo "::notice title=iOS build::built with $tfm"; ok=1; break
+            fi
+            echo "::warning title=iOS $tfm::$(grep -m1 -E 'error' build-$tfm.log | cut -c1-400)"
+          done
+          if [ $ok != 1 ]; then cat build-*.log > build.log; ../.github/annotate.sh "iOS build failed" build.log; exit 1; fi
 
       - name: Package unsigned IPA
         working-directory: maui-client

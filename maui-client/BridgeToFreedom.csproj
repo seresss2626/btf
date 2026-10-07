@@ -4,7 +4,10 @@
          net10.0 is always present: shared lib consumed by ../maui-client-linux. -->
     <TargetFrameworks>net10.0</TargetFrameworks>
     <TargetFrameworks Condition="!$([MSBuild]::IsOSPlatform('Linux'))">$(TargetFrameworks);net10.0-android;net10.0-windows10.0.19041.0</TargetFrameworks>
-    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('OSX'))">$(TargetFrameworks);net10.0-ios;net10.0-maccatalyst</TargetFrameworks>
+    <!-- IosTfm can pin an iOS SDK version (e.g. net10.0-ios26.0) when the newest
+         .NET iOS SDK needs a newer Xcode than the build machine has. -->
+    <IosTfm Condition="'$(IosTfm)' == ''">net10.0-ios</IosTfm>
+    <TargetFrameworks Condition="$([MSBuild]::IsOSPlatform('OSX'))">$(TargetFrameworks);$(IosTfm);net10.0-maccatalyst</TargetFrameworks>
     <OutputType>Exe</OutputType>
     <!-- net10.0 is a shared lib for the Linux head; no platform Main. -->
     <OutputType Condition="'$(TargetFramework)' == 'net10.0'">Library</OutputType>
@@ -45,7 +48,7 @@
     <PublishTrimmed>true</PublishTrimmed>
   </PropertyGroup>
 
-  <PropertyGroup Condition="'$(TargetFramework)'=='net10.0-ios'">
+  <PropertyGroup Condition="$([MSBuild]::GetTargetPlatformIdentifier('$(TargetFramework)')) == 'ios'">
     <MtouchLink>SdkOnly</MtouchLink>
     <!-- Remove to disable silent-audio background mode (may cause App Store rejection). -->
     <DefineConstants>$(DefineConstants);IOS_BACKGROUND_AUDIO</DefineConstants>
