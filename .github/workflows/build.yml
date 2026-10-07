@@ -312,16 +312,24 @@ jobs:
           # The newest .NET iOS SDK may need a newer Xcode than the runner has;
           # fall back to an iOS 26.x SDK that matches the installed Xcode 26.
           ok=0
-          for tfm in net10.0-ios net10.0-ios26.5 net10.0-ios26.4 net10.0-ios26.2 net10.0-ios26.0; do
-            echo "=== trying $tfm"
+          try() { # $1 = tfm, $2 = Xcode app (optional)
+            [ -n "$2" ] && [ -d "/Applications/$2" ] || [ -z "$2" ] || return 1
+            [ -n "$2" ] && sudo xcode-select -s "/Applications/$2"
+            echo "=== trying $1 with $(xcodebuild -version | head -1)"
             rm -rf bin obj
-            if dotnet build BridgeToFreedom.csproj -f $tfm -c Release -p:IosTfm=$tfm \
+            if dotnet build BridgeToFreedom.csproj -f $1 -c Release -p:IosTfm=$1 \
                  -p:RuntimeIdentifier=ios-arm64 -p:EnableCodeSigning=false -p:ValidateXcodeVersion=false \
-                 2>&1 | tee build-$tfm.log; then
-              echo "::notice title=iOS build::built with $tfm"; ok=1; break
+                 2>&1 | tee "build-$1-$2.log"; then
+              echo "::notice title=iOS build::built with $1 / $(xcodebuild -version | head -1)"; return 0
             fi
-            echo "::warning title=iOS $tfm::$(grep -m1 -E 'error' build-$tfm.log | cut -c1-400)"
-          done
+            echo "::warning title=iOS $1 $2::$(grep -m1 -E 'error' "build-$1-$2.log" | cut -c1-400)"
+            return 1
+          }
+          if try net10.0-ios ""; then ok=1; else
+            for xc in Xcode_26.0.1.app Xcode_26.0.app Xcode_26.1.1.app Xcode_26.2.app Xcode_26.3.app Xcode_26.4.1.app Xcode_26.5.app Xcode_26.6.app; do
+              if try net10.0-ios26.0 $xc; then ok=1; break; fi
+            done
+          fi
           if [ $ok != 1 ]; then cat build-*.log > build.log; ../.github/annotate.sh "iOS build failed" build.log; exit 1; fi
 
       - name: Package unsigned IPA
