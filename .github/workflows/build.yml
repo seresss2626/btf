@@ -43,9 +43,19 @@ jobs:
         run: dotnet run -c Release --project tests/maui-services
       - name: End-to-end (simulated Yandex Cloud)
         run: |
+          set -o pipefail
           (cd tests/e2e && npm install --no-audit --no-fund)
-          SIM_INSTANCES=3 START_ORDER=adapter-first tests/e2e/run.sh
-          SIM_INSTANCES=3 START_ORDER=helpers-first SKIP_MAUI=1 tests/e2e/run.sh
+          rc=0
+          SIM_INSTANCES=3 START_ORDER=adapter-first tests/e2e/run.sh 2>&1 | tee e2e1.log || rc=1
+          SIM_INSTANCES=3 START_ORDER=helpers-first SKIP_MAUI=1 tests/e2e/run.sh 2>&1 | tee e2e2.log || rc=1
+          if [ $rc != 0 ]; then
+            for f in e2e1.log e2e2.log; do
+              d=$(sed -n 's/^logs: //p' $f | tail -1)
+              { cat $f; [ -n "$d" ] && for l in "$d"/*.log; do echo "---- $l"; grep -v DEBUG "$l" | tail -25; done; } > "$f.full"
+              .github/annotate.sh "e2e failed ($f)" "$f.full"
+            done
+            exit 1
+          fi
 
   # ---------------------------------------------------------------------------
   # Go: adapter + helper for linux/amd64, linux/arm64, windows/amd64
@@ -296,8 +306,10 @@ jobs:
       - name: Build for device without code signing
         working-directory: maui-client
         run: |
+          set -o pipefail
           dotnet build BridgeToFreedom.csproj -f net10.0-ios -c Release \
-            -p:RuntimeIdentifier=ios-arm64 -p:EnableCodeSigning=false
+            -p:RuntimeIdentifier=ios-arm64 -p:EnableCodeSigning=false 2>&1 | tee build.log || {
+            ../.github/annotate.sh "iOS build failed" build.log; exit 1; }
 
       - name: Package unsigned IPA
         working-directory: maui-client
