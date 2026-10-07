@@ -335,8 +335,9 @@ jobs:
       - name: Package unsigned IPA
         working-directory: maui-client
         run: |
-          APP=$(find bin/Release/net10.0-ios -type d -name '*.app' | head -1)
-          test -n "$APP" || { echo "no .app produced"; exit 1; }
+          APP=$(find bin/Release -path '*ios*' -type d -name '*.app' | head -1)
+          test -n "$APP" || { echo "::error title=IPA::no .app under $(find bin -maxdepth 4 -type d | tr '\n' ' ')"; exit 1; }
+          echo "::notice title=IPA::packaging $APP"
           mkdir -p out/Payload
           cp -R "$APP" out/Payload/
           (cd out && zip -qry BridgeToFreedom-ios-unsigned.ipa Payload)
