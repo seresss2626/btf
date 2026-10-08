@@ -150,6 +150,9 @@ func (c *Config) Validate(role string) (warnings []string, err error) {
 		if c.HTTP.ListenPort <= 0 || c.HTTP.ListenPort > 65535 {
 			return nil, errors.New("http.listenPort must be 1..65535 (the cloud function needs the recovery endpoint)")
 		}
+		if strings.Contains(c.HTTP.Path, "://") || strings.ContainsAny(c.HTTP.Path, " ?#") {
+			return nil, fmt.Errorf("http.path must be only the path, e.g. \"/k7m2p9x4\" (got %q); the full URL goes into the cloud function's HTTP_URL", c.HTTP.Path)
+		}
 		if c.HTTP.Path == "" || c.HTTP.Path == "/conn-ids" {
 			warnings = append(warnings, "http.path is the default /conn-ids; consider a random path")
 		}
